@@ -84,8 +84,8 @@ class MangaDotScraper(BaseScraper):
     @cached_method(ttl=3600)
     def get_manga(self, url: str) -> Manga:
         """Fetch manga details on MangaDot."""
-        # Load the details page using Playwright to handle dynamic SSR mounting
-        html = fetch_html(url, use_playwright=True, wait_selector="h1")
+        # Fetch raw HTML without Playwright since metadata is server-side rendered
+        html = fetch_html(url, use_playwright=False)
         soup = BeautifulSoup(html, "html.parser")
         
         # Meta tags (very robust source of metadata)
@@ -164,79 +164,86 @@ class MangaDotScraper(BaseScraper):
     def get_chapters(self, url: str, html_content: str = None) -> List[Chapter]:
         """Fetch chapters for a MangaDot URL."""
         logger.info(f"Retrieving chapters for MangaDot: {url}")
-        chapters = []
         
-        # Try Playwright network interception of JSON responses first
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
+        # Extract manga ID from URL
+        match = re.search(r'/manga/(\d+)', url)
+        if not match:
+            logger.warning(f"Could not extract manga ID from URL: {url}")
+            return []
             
-            def handle_response(response):
-                try:
-                    # Capture JSON API payloads
-                    if "application/json" in response.headers.get("content-type", "") or ".data" in response.url:
-                        data = response.json()
-                        extracted = self._extract_chapters_from_json(data)
-                        if extracted:
-                            chapters.extend(extracted)
-                except Exception:
-                    pass
-
-            page.on("response", handle_response)
-            try:
-                page.goto(url, timeout=30000)
-                page.wait_for_selector("a[href*='/chapter/']", timeout=15000)
-                page.wait_for_timeout(3000)
-            except Exception as e:
-                logger.warning(f"Timeout waiting for chapters to render: {e}")
-            finally:
-                browser.close()
+        manga_id = int(match.group(1))
+        api_url = f"{self.BASE_URL}/api/manga/{manga_id}/chapters/list"
+        logger.info(f"Fetching manga chapters list from: {api_url}")
+        
+        chapters = []
+        try:
+            # Fetch JSON list of chapters directly using standard fetch (no Playwright)
+            html = fetch_html(api_url, use_playwright=False)
+            import json
+            chapters_data = json.loads(html)
+            
+            for item in chapters_data:
+                ch_id = item.get("id")
+                if not ch_id:
+                    continue
+                num_val = item.get("chapter_number")
+                num = str(num_val) if num_val is not None else ""
+                if not num:
+                    continue
+                title = item.get("chapter_title") or ""
+                date_str = item.get("date_added") or ""
+                release_date = date_str.split(" ")[0] if " " in date_str else date_str
                 
-        # Deduplicate network-extracted chapters
-        if chapters:
-            seen_urls = set()
-            deduped = []
-            for c in chapters:
-                if c.url not in seen_urls:
-                    seen_urls.add(c.url)
-                    deduped.append(c)
-            chapters = deduped
+                ch_url = f"{self.BASE_URL}/chapter/{ch_id}"
+                chapters.append(Chapter(
+                    number=num,
+                    title=title.strip(),
+                    url=ch_url,
+                    release_date=release_date.strip()
+                ))
+        except Exception as e:
+            logger.error(f"Failed to fetch chapters list from JSON API: {e}. Falling back to DOM parsing...")
 
-        # Fallback to DOM parsing if network interception yielded no chapters
+        # Fallback to DOM parsing without Playwright
         if not chapters:
-            logger.warning("Network interception failed. Falling back to DOM parsing...")
-            if not html_content:
-                html_content = fetch_html(url, use_playwright=True, wait_selector="a[href*='/chapter/']")
-            soup = BeautifulSoup(html_content, "html.parser")
-            
-            # Find links containing /chapter/
-            links = soup.select("a[href*='/chapter/']")
-            for link in links:
-                href = link.get("href", "")
-                ch_url = f"{self.BASE_URL}{href}" if href.startswith("/") else href
+            logger.warning("Falling back to DOM parsing...")
+            try:
+                if not html_content:
+                    html_content = fetch_html(url, use_playwright=False)
+                soup = BeautifulSoup(html_content, "html.parser")
                 
-                # Check for chapter number inside spans (e.g. "Ch 1189")
-                num_el = link.select_one("span[class*='text-white/85']")
-                number = num_el.text.strip() if num_el else ""
-                number = re.sub(r'^[Cc]h\s*', '', number)
-                
-                title_el = link.select_one("span[class*='text-white/95']")
-                title = title_el.text.strip() if title_el else ""
-                
-                date_el = link.select_one("span[class*='text-white/45']")
-                release_date = date_el.text.strip() if date_el else ""
-                
-                if ch_url and not any(c.url == ch_url for c in chapters):
-                    chapters.append(Chapter(
-                        number=number,
-                        title=title,
-                        url=ch_url,
-                        release_date=release_date
-                    ))
+                # Find links containing /chapter/
+                links = soup.select("a[href*='/chapter/']")
+                for link in links:
+                    href = link.get("href", "")
+                    ch_url = f"{self.BASE_URL}{href}" if href.startswith("/") else href
                     
+                    # Extract chapter ID from URL to validate link format
+                    match_ch = re.search(r'/chapter/(\d+)', ch_url)
+                    if not match_ch:
+                        continue
+                        
+                    # Check for chapter number inside spans (e.g. "Ch 1189")
+                    num_el = link.select_one("span[class*='text-white/85']")
+                    number = num_el.text.strip() if num_el else ""
+                    number = re.sub(r'^[Cc]h\s*', '', number)
+                    
+                    title_el = link.select_one("span[class*='text-white/95']")
+                    title = title_el.text.strip() if title_el else ""
+                    
+                    date_el = link.select_one("span[class*='text-white/45']")
+                    release_date = date_el.text.strip() if date_el else ""
+                    
+                    if ch_url and not any(c.url == ch_url for c in chapters):
+                        chapters.append(Chapter(
+                            number=number,
+                            title=title,
+                            url=ch_url,
+                            release_date=release_date
+                        ))
+            except Exception as dom_err:
+                logger.error(f"DOM fallback failed: {dom_err}")
+                
         # Preserve ascending page order (oldest to newest)
         try:
             if len(chapters) > 1:
@@ -248,25 +255,6 @@ class MangaDotScraper(BaseScraper):
         except Exception:
             chapters.reverse()
             
-        return chapters
-
-    def _extract_chapters_from_json(self, data: Any) -> List[Chapter]:
-        """Recursively scan dynamic JSON payload to extract chapters."""
-        chapters = []
-        if isinstance(data, dict):
-            if "chapter_number" in data and "id" in data:
-                cid = data["id"]
-                num = str(data["chapter_number"])
-                title = str(data.get("chapter_title") or "")
-                date = str(data.get("date_added") or "")
-                url = f"{self.BASE_URL}/chapter/{cid}"
-                chapters.append(Chapter(number=num, title=title, url=url, release_date=date))
-            else:
-                for v in data.values():
-                    chapters.extend(self._extract_chapters_from_json(v))
-        elif isinstance(data, list):
-            for item in data:
-                chapters.extend(self._extract_chapters_from_json(item))
         return chapters
 
     @cached_method(ttl=3600)
@@ -313,13 +301,13 @@ class MangaDotScraper(BaseScraper):
                         pages.append(full_url)
                 logger.info(f"[get_pages] Extracted {len(pages)} page images from API for chapter_id={chapter_id}")
         except Exception as e:
-            logger.warning(f"[get_pages] Failed to parse images API JSON ({e}). Falling back to Playwright DOM parsing...")
+            logger.warning(f"[get_pages] Failed to parse images API JSON ({e}). Falling back to HTML parsing...")
             
-        # Playwright fallback
+        # HTML fallback
         if not pages:
             try:
-                logger.info(f"[get_pages] HTML fallback: fetching {chapter_url} with Playwright")
-                html = fetch_html(chapter_url, use_playwright=True, wait_selector="img")
+                logger.info(f"[get_pages] HTML fallback: fetching {chapter_url}")
+                html = fetch_html(chapter_url, use_playwright=False)
                 soup = BeautifulSoup(html, "html.parser")
                 
                 # Validate canonical URL matches the requested chapter
