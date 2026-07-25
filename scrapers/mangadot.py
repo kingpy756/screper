@@ -278,34 +278,71 @@ class MangaDotScraper(BaseScraper):
             raise ValueError(f"Invalid chapter URL format: {chapter_url}")
             
         chapter_id = match.group(1)
-        api_url = f"{self.BASE_URL}/api/uploads/{chapter_id}/images"
+        api_url = f"{self.BASE_URL}/api/chapters/{chapter_id}/images"
         
-        logger.info(f"Querying MangaDot chapter images API: {api_url}")
+        logger.info(f"[get_pages] Querying MangaDot chapter images API: {api_url} for chapter_id: {chapter_id}")
         
-        # Load API payload using standard fetch
-        html = fetch_html(api_url, use_playwright=False)
-        
+        pages = []
         try:
+            # Load API payload using standard fetch
+            html = fetch_html(api_url, use_playwright=False)
             import json
             data = json.loads(html)
-            pages = []
-            for img in data.get("images", []):
-                url_path = img.get("url", "")
-                if url_path:
-                    full_url = f"{self.BASE_URL}{url_path}" if url_path.startswith("/") else url_path
-                    pages.append(full_url)
-            return {"pages": pages}
+            
+            # --- Validate the response belongs to the requested chapter ---
+            response_chapter = data.get("chapter", {})
+            response_chapter_id = response_chapter.get("id")
+            response_manga_title = data.get("manga", {}).get("title", "unknown")
+            
+            logger.info(
+                f"[get_pages] Response: chapter_id={response_chapter_id}, "
+                f"manga_title='{response_manga_title}', page_count={response_chapter.get('page_count')}"
+            )
+            
+            if response_chapter_id is not None and int(response_chapter_id) != int(chapter_id):
+                logger.error(
+                    f"[get_pages] CHAPTER ID MISMATCH! Requested chapter_id={chapter_id} "
+                    f"but API returned chapter_id={response_chapter_id} "
+                    f"(manga: '{response_manga_title}'). Discarding response."
+                )
+            else:
+                for img in data.get("images", []):
+                    url_path = img.get("url", "")
+                    if url_path:
+                        full_url = f"{self.BASE_URL}{url_path}" if url_path.startswith("/") else url_path
+                        pages.append(full_url)
+                logger.info(f"[get_pages] Extracted {len(pages)} page images from API for chapter_id={chapter_id}")
         except Exception as e:
-            logger.warning(f"Failed to parse images API JSON ({e}). Falling back to Playwright DOM parsing...")
+            logger.warning(f"[get_pages] Failed to parse images API JSON ({e}). Falling back to Playwright DOM parsing...")
             
         # Playwright fallback
-        pages = []
-        html = fetch_html(chapter_url, use_playwright=True, wait_selector="img[src*='/chapters/']")
-        soup = BeautifulSoup(html, "html.parser")
-        for img in soup.select("img"):
-            src = img.get("src") or img.get("data-src")
-            if src and "/chapters/" in src and src not in pages:
-                full_url = f"{self.BASE_URL}{src}" if src.startswith("/") else src
-                pages.append(full_url)
+        if not pages:
+            try:
+                logger.info(f"[get_pages] HTML fallback: fetching {chapter_url} with Playwright")
+                html = fetch_html(chapter_url, use_playwright=True, wait_selector="img")
+                soup = BeautifulSoup(html, "html.parser")
+                
+                # Validate canonical URL matches the requested chapter
+                canonical = soup.select_one("link[rel='canonical']")
+                if canonical:
+                    canonical_href = canonical.get("href", "")
+                    if f"/chapter/{chapter_id}" not in canonical_href:
+                        logger.error(
+                            f"[get_pages] HTML fallback canonical URL mismatch! "
+                            f"Expected /chapter/{chapter_id}, got '{canonical_href}'. Aborting fallback."
+                        )
+                        return {"pages": []}
+                
+                for img in soup.select("img"):
+                    src = img.get("src") or img.get("data-src")
+                    # Only match actual chapter page images (from /chapters/ path),
+                    # NOT cover art or other uploads (from /uploads/ path)
+                    if src and "/chapters/" in src:
+                        full_url = f"{self.BASE_URL}{src}" if src.startswith("/") else src
+                        if full_url not in pages:
+                            pages.append(full_url)
+                logger.info(f"[get_pages] HTML fallback extracted {len(pages)} page images for chapter_id={chapter_id}")
+            except Exception as e:
+                logger.error(f"[get_pages] HTML fallback failed for chapter_id={chapter_id}: {e}")
                 
         return {"pages": pages}

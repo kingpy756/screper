@@ -103,6 +103,110 @@ def get_chapter_pages(url: str = Query(..., description="The chapter reader URL"
         logger.error(f"Failed to fetch pages: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/search")
+def api_search(q: str = Query(..., min_length=1, description="Search query")):
+    import re
+    try:
+        md_scraper = MangaDotScraper()
+        md_results = md_scraper.search(q)
+        results = []
+        for r in md_results:
+            url = r.get("url", "")
+            match = re.search(r'/manga/(\d+)', url)
+            if match:
+                m_id = int(match.group(1))
+                results.append({
+                    "id": m_id,
+                    "title": r.get("title", ""),
+                    "cover": r.get("cover", "")
+                })
+        return {
+            "success": True,
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"API Search failed: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "results": []
+        }
+
+@app.get("/api/chapters")
+def api_chapters(
+    id: int = Query(..., description="Manga ID"),
+    language: Optional[str] = Query("en", description="Language filter")
+):
+    import re
+    try:
+        md_scraper = MangaDotScraper()
+        url = f"https://mangadot.net/manga/{id}"
+        chapters_data = md_scraper.get_chapters(url)
+        
+        chapter_list = []
+        for ch in chapters_data:
+            ch_url = ch.url
+            match = re.search(r'/chapter/(\d+)', ch_url)
+            if not match:
+                continue
+            ch_id = int(match.group(1))
+            
+            chapter_list.append({
+                "id": ch_id,
+                "number": ch.number,
+                "title": ch.title,
+                "release_date": ch.release_date,
+                "language": "en",
+                "group": "Unknown"
+            })
+            
+        lang = (language or "en").strip().lower()
+        if lang != "all":
+            chapter_list = [
+                ch for ch in chapter_list
+                if ch.get("language") == lang
+            ]
+            
+        seen_numbers = set()
+        deduped = []
+        for ch in chapter_list:
+            num = str(ch.get("number") or "").strip()
+            if num not in seen_numbers:
+                seen_numbers.add(num)
+                deduped.append(ch)
+                
+        return {
+            "success": True,
+            "total": len(deduped),
+            "chapters": deduped
+        }
+    except Exception as e:
+        logger.error(f"API Chapters failed: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "total": 0,
+            "chapters": []
+        }
+
+@app.get("/api/pages")
+def api_pages(id: int = Query(..., description="Chapter ID")):
+    try:
+        md_scraper = MangaDotScraper()
+        url = f"https://mangadot.net/chapter/{id}"
+        pages_data = md_scraper.get_pages(url)
+        return {
+            "success": True,
+            "pages": pages_data.get("pages", [])
+        }
+    except Exception as e:
+        logger.error(f"API Pages failed: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "pages": []
+        }
+
 def run_cli():
     parser = argparse.ArgumentParser(
         description="Modular Python Manga Scraper CLI for mangafire.to and mangadot.net"
